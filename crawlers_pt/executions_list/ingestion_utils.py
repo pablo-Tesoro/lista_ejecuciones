@@ -105,75 +105,151 @@ class LetterSnapshot:
     first_hash: str | None
     first_values: tuple | None
     rows: list[dict]
+    # >0 en una carga incremental: `rows` son sólo las altas y la foto se
+    # completa arrastrando estas filas de la última foto de Bronze.
+    carried_rows: int = 0
+
+
+def row_values(row: dict) -> tuple:
+    """Los 9 campos crudos de una fila de Bronze, en el orden canónico."""
+    return tuple((row[c] or "") for c in SITE_FIELDS)
+
+
+class LetterCrawl:
+    """
+    Descarga de una letra que puede pararse tras las primeras N filas y
+    reanudarse después: las páginas ya leídas no se vuelven a pedir.
+    """
+
+    def __init__(self, crawler: CitiusCrawler, *, letter: str, page1):
+        self.crawler = crawler
+        self.letter = letter
+        self.expected_total = int(page1.record_count or 0)
+
+        if not page1.parsed_rows and self.expected_total > 0:
+            raise RuntimeError(
+                f"Letter {letter}: page 1 returned 0 rows but the counter says "
+                f"{self.expected_total}."
+            )
+
+        self.rows: list[dict] = []
+        self._visited: set[str] = set()
+        self._current = page1
+        self._page_no = 1
+        self._exhausted = False
+        self._consume_current()
+
+    def _consume_current(self) -> None:
+        current, page_no = self._current, self._page_no
+
+        if current.page_signature and current.page_signature in self._visited:
+            raise RuntimeError(
+                f"Letter {self.letter}: pagination loop detected at page {page_no}.")
+        if current.page_signature:
+            self._visited.add(current.page_signature)
+
+        if page_no > 1 and not current.parsed_rows:
+            raise RuntimeError(f"Letter {self.letter}: page {page_no} returned 0 rows.")
+
+        remaining = self.expected_total - len(self.rows)
+        page_rows = current.parsed_rows[:max(remaining, 0)]
+        for pos, rec in enumerate(page_rows, start=1):
+            self.rows.append(
+                record_to_row(rec, letter=self.letter, page_number=page_no, position=pos))
+
+        if not current.next_page_number or len(self.rows) >= self.expected_total:
+            self._exhausted = True
+
+    def _advance(self) -> None:
+        settings = self.crawler.settings
+        next_page = self._current.next_page_number
+        if (settings.reset_session_every_pages > 0
+                and next_page % settings.reset_session_every_pages == 0):
+            self.crawler.reset_session()
+
+        self._current = self.crawler.fetch_page(
+            self._current.soup, next_page, letter=self.letter)
+        self._page_no = next_page
+
+        if (settings.long_pause_every_pages > 0
+                and next_page % settings.long_pause_every_pages == 0):
+            time.sleep(settings.long_pause_min_s)
+        else:
+            self.crawler.polite_pause()
+
+        self._consume_current()
+
+    def fetch_until(self, n_rows: int) -> None:
+        """Pagina hasta tener al menos n_rows filas o llegar al final."""
+        while len(self.rows) < n_rows and not self._exhausted:
+            self._advance()
+
+    @property
+    def pages_read(self) -> int:
+        return self._page_no
+
+    def finish(self) -> LetterSnapshot:
+        """Completa la descarga y comprueba que cuadra con el contador."""
+        self.fetch_until(self.expected_total)
+
+        if len(self.rows) != self.expected_total:
+            raise RuntimeError(
+                f"Letter {self.letter}: crawled {len(self.rows)} rows but the counter said "
+                f"{self.expected_total}."
+            )
+
+        first = self.rows[0] if self.rows else None
+        return LetterSnapshot(
+            letter=self.letter,
+            total_records=self.expected_total,
+            total_pages=max(1, -(-self.expected_total // ROWS_PER_PAGE)),
+            first_hash=row_hash_from_values(first[c] for c in SITE_FIELDS) if first else None,
+            first_values=row_values(first) if first else None,
+            rows=self.rows,
+        )
 
 
 def crawl_letter(crawler: CitiusCrawler, *, letter: str, page1) -> LetterSnapshot:
     """Descarga la letra entera en memoria. Aborta si algo no cuadra."""
-    settings = crawler.settings
-    expected_total = int(page1.record_count or 0)
+    return LetterCrawl(crawler, letter=letter, page1=page1).finish()
 
-    if not page1.parsed_rows and expected_total > 0:
-        raise RuntimeError(
-            f"Letter {letter}: page 1 returned 0 rows but the counter says {expected_total}."
+
+def crawl_letter_incremental(
+    crawler: CitiusCrawler, *, letter: str, page1, previous_total: int,
+    previous_first_values: tuple,
+) -> LetterSnapshot:
+    """
+    Las altas entran por arriba del listado. Si el contador creció en k y el
+    primer registro de la última foto aparece justo en la posición k+1, no hubo
+    bajas: basta con descargar las k altas y arrastrar la foto anterior.
+
+    Si no aparece en esa posición (hubo bajas, o un alta no entró por arriba),
+    se sigue paginando hasta completar la letra, sin repetir lo ya leído.
+    """
+    crawl = LetterCrawl(crawler, letter=letter, page1=page1)
+    k = crawl.expected_total - previous_total
+    if k <= 0:
+        raise ValueError(f"Letter {letter}: incremental load needs a larger total (k={k}).")
+
+    crawl.fetch_until(k + 1)
+    if len(crawl.rows) > k and row_values(crawl.rows[k]) == previous_first_values:
+        new_rows = crawl.rows[:k]
+        first = new_rows[0]
+        logger.info("Letter %s -> incremental: %s new rows in %s pages, %s carried from "
+                    "the last Bronze snapshot", letter, k, crawl.pages_read, previous_total)
+        return LetterSnapshot(
+            letter=letter,
+            total_records=crawl.expected_total,
+            total_pages=max(1, -(-crawl.expected_total // ROWS_PER_PAGE)),
+            first_hash=row_hash_from_values(first[c] for c in SITE_FIELDS),
+            first_values=row_values(first),
+            rows=new_rows,
+            carried_rows=previous_total,
         )
 
-    rows: list[dict] = []
-    processed = 0
-    visited: set[str] = set()
-    current = page1
-    page_no = 1
-
-    while True:
-        if current.page_signature and current.page_signature in visited:
-            raise RuntimeError(f"Letter {letter}: pagination loop detected at page {page_no}.")
-        if current.page_signature:
-            visited.add(current.page_signature)
-
-        if page_no > 1 and not current.parsed_rows:
-            raise RuntimeError(f"Letter {letter}: page {page_no} returned 0 rows.")
-
-        page_rows = current.parsed_rows
-        remaining = expected_total - processed
-        if remaining <= 0:
-            break
-        if len(page_rows) > remaining:
-            page_rows = page_rows[:remaining]
-
-        for pos, rec in enumerate(page_rows, start=1):
-            rows.append(record_to_row(rec, letter=letter, page_number=page_no, position=pos))
-        processed += len(page_rows)
-
-        if not current.next_page_number or processed >= expected_total:
-            break
-
-        next_page = current.next_page_number
-        if (settings.reset_session_every_pages > 0
-                and next_page % settings.reset_session_every_pages == 0):
-            crawler.reset_session()
-
-        current = crawler.fetch_page(current.soup, next_page, letter=letter)
-        page_no = next_page
-
-        if (settings.long_pause_every_pages > 0
-                and page_no % settings.long_pause_every_pages == 0):
-            time.sleep(settings.long_pause_min_s)
-        else:
-            crawler.polite_pause()
-
-    if processed != expected_total:
-        raise RuntimeError(
-            f"Letter {letter}: crawled {processed} rows but the counter said {expected_total}."
-        )
-
-    first = next((r for r in rows if r["page_number"] == 1 and r["position_in_page"] == 1), None)
-    return LetterSnapshot(
-        letter=letter,
-        total_records=expected_total,
-        total_pages=max(1, -(-expected_total // ROWS_PER_PAGE)),
-        first_hash=row_hash_from_values(first[c] for c in SITE_FIELDS) if first else None,
-        first_values=tuple((first[c] or "") for c in SITE_FIELDS) if first else None,
-        rows=rows,
-    )
+    logger.info("Letter %s -> last snapshot's first record is not at position %s "
+                "(removals or non-top inclusions) -> full download", letter, k + 1)
+    return crawl.finish()
 
 
 # ==========================================================
@@ -206,21 +282,35 @@ def read_control_totals(spark, catalog: str) -> dict[str, int]:
     return {r["letter"]: int(r["total_records"]) for r in rows}
 
 
-def read_bronze_first_values(spark, catalog: str) -> dict[str, tuple]:
-    """letter -> 9 campos crudos del primer registro del último snapshot."""
+@dataclass(frozen=True)
+class BronzeSnapshotInfo:
+    first_values: tuple
+    total_rows: int
+
+
+def read_bronze_last_snapshots(spark, catalog: str) -> dict[str, BronzeSnapshotInfo]:
+    """letter -> primer registro (9 campos crudos) y nº de filas del último snapshot."""
     cols = ", ".join(f"b.{c}" for c in SITE_FIELDS)
     try:
         rows = spark.sql(f"""
-            SELECT b.letter, {cols}
-              FROM {catalog}.{BRONZE_TABLE} b
-              JOIN (SELECT letter, MAX(dp_update_ts) AS ts
-                      FROM {catalog}.{BRONZE_TABLE} GROUP BY letter) m
-                ON b.letter = m.letter AND b.dp_update_ts = m.ts
-             WHERE b.page_number = 1 AND b.position_in_page = 1
+            SELECT letter, total_rows, {", ".join(SITE_FIELDS)}
+              FROM (SELECT b.letter, b.page_number, b.position_in_page, {cols},
+                           COUNT(*) OVER (PARTITION BY b.letter) AS total_rows
+                      FROM {catalog}.{BRONZE_TABLE} b
+                      JOIN (SELECT letter, MAX(dp_update_ts) AS ts
+                              FROM {catalog}.{BRONZE_TABLE} GROUP BY letter) m
+                        ON b.letter = m.letter AND b.dp_update_ts = m.ts)
+             WHERE page_number = 1 AND position_in_page = 1
         """).collect()
     except Exception:
         return {}
-    return {r["letter"]: tuple((r[c] or "") for c in SITE_FIELDS) for r in rows}
+    return {
+        r["letter"]: BronzeSnapshotInfo(
+            first_values=tuple((r[c] or "") for c in SITE_FIELDS),
+            total_rows=int(r["total_rows"]),
+        )
+        for r in rows
+    }
 
 
 def silver_has_current_hash(spark, catalog: str, letter: str, row_hash: str) -> bool:
@@ -247,6 +337,11 @@ def write_letter_snapshot(spark, catalog: str, snapshot: LetterSnapshot) -> None
     Una sola sentencia inserta todas las filas de la letra, así que
     ingestion_date y dp_update_ts se evalúan una vez y todas las filas
     comparten instante: ese instante identifica el snapshot.
+
+    En una carga incremental esa misma sentencia añade, detrás de las altas,
+    las filas de la última foto de la letra desplazadas tantas posiciones como
+    altas hay. Su row_hash no cambia (no depende de la posición), así que la
+    transformación no las toca.
     """
     letter = snapshot.letter
     if not letter.isalpha() or len(letter) != 1:
@@ -260,14 +355,31 @@ def write_letter_snapshot(spark, catalog: str, snapshot: LetterSnapshot) -> None
         [tuple(r[c] for c in BRONZE_DATA_COLUMNS) for r in snapshot.rows],
         schema=BRONZE_DATA_DDL,
     )
+    if snapshot.carried_rows:
+        table = f"{catalog}.{BRONZE_TABLE}"
+        shift = len(snapshot.rows)
+        carried = spark.sql(f"""
+            SELECT {", ".join(SITE_FIELDS)}, letter,
+                   CAST(idx DIV {ROWS_PER_PAGE} + 1 AS INT) AS page_number,
+                   CAST(idx % {ROWS_PER_PAGE} + 1 AS INT) AS position_in_page
+              FROM (SELECT *,
+                           (page_number - 1) * {ROWS_PER_PAGE} + position_in_page - 1 + {shift}
+                               AS idx
+                      FROM {table}
+                     WHERE letter = '{letter}'
+                       AND dp_update_ts = (SELECT MAX(dp_update_ts) FROM {table}
+                                            WHERE letter = '{letter}'))
+        """)
+        df = df.unionByName(carried)
     df = (
         df.withColumn("ingestion_date", F.current_date())
         .withColumn("dp_update_ts", F.current_timestamp())
     )
     df.write.format("delta").mode("append").saveAsTable(f"{catalog}.{BRONZE_TABLE}")
 
-    logger.info("Letter %s loaded | rows=%s pages=%s",
-                letter, len(snapshot.rows), snapshot.total_pages)
+    logger.info("Letter %s loaded | rows=%s (downloaded=%s carried=%s) pages=%s",
+                letter, len(snapshot.rows) + snapshot.carried_rows, len(snapshot.rows),
+                snapshot.carried_rows, snapshot.total_pages)
 
 
 # ==========================================================
@@ -281,7 +393,7 @@ def run_ingestion(
     letters: list[str],
     forced_letters: list[str] | None = None,
     control_loader=read_control_totals,
-    bronze_loader=read_bronze_first_values,
+    bronze_loader=read_bronze_last_snapshots,
     silver_checker=silver_has_current_hash,
     snapshot_writer=write_letter_snapshot,
 ) -> dict:
@@ -296,13 +408,14 @@ def run_ingestion(
     force = {x.upper() for x in (forced_letters or [])}
 
     control = control_loader(spark, catalog)
-    bronze_first = bronze_loader(spark, catalog)
-    logger.info("Current state -> letters in control: %s, first records in Bronze: %s",
-                len(control), len(bronze_first))
+    bronze_last = bronze_loader(spark, catalog)
+    logger.info("Current state -> letters in control: %s, snapshots in Bronze: %s",
+                len(control), len(bronze_last))
 
     crawler = CitiusCrawler(logger=logger, settings=settings)
 
     loaded: list[str] = []
+    loaded_incremental: list[str] = []
     skipped: list[str] = []
     skipped_pending: list[str] = []
     failed: dict[str, str] = {}
@@ -316,7 +429,8 @@ def run_ingestion(
                 fresh_hash = first_record_hash(page1.parsed_rows, site_total)
 
                 stored_total = control.get(letter)
-                bronze_values = bronze_first.get(letter)
+                bronze_snapshot = bronze_last.get(letter)
+                bronze_values = bronze_snapshot.first_values if bronze_snapshot else None
 
                 if letter in force:
                     reason = "forced"
@@ -344,10 +458,31 @@ def run_ingestion(
                     skipped_pending.append(letter)
                     continue
 
-                logger.info("Letter %s -> full download (%s)", letter, reason)
-                snapshot = crawl_letter(crawler, letter=letter, page1=page1)
+                # Incremental sólo si la última foto de Bronze es la que refleja
+                # letter_control (mismo nº de filas) y el contador ha crecido.
+                can_be_incremental = (
+                    letter not in force
+                    and stored_total is not None
+                    and bronze_snapshot is not None
+                    and bronze_snapshot.total_rows == stored_total
+                    and site_total > stored_total
+                )
+                if can_be_incremental:
+                    logger.info("Letter %s -> trying incremental load (%s: %s -> %s)",
+                                letter, reason, stored_total, site_total)
+                    snapshot = crawl_letter_incremental(
+                        crawler, letter=letter, page1=page1,
+                        previous_total=stored_total,
+                        previous_first_values=bronze_snapshot.first_values,
+                    )
+                else:
+                    logger.info("Letter %s -> full download (%s)", letter, reason)
+                    snapshot = crawl_letter(crawler, letter=letter, page1=page1)
+
                 snapshot_writer(spark, catalog, snapshot)
                 loaded.append(letter)
+                if snapshot.carried_rows:
+                    loaded_incremental.append(letter)
 
             except Exception as exc:
                 logger.exception("Letter %s failed; nothing written for it.", letter)
@@ -359,12 +494,14 @@ def run_ingestion(
 
     summary = {
         "loaded": loaded,
+        "loaded_incremental": loaded_incremental,
         "skipped": skipped,
         "skipped_pending_silver": skipped_pending,
         "failed": failed,
     }
-    logger.info("Letters -> loaded=%s skipped=%s pending_silver=%s failed=%s",
-                len(loaded), len(skipped), len(skipped_pending), len(failed))
+    logger.info("Letters -> loaded=%s (incremental=%s) skipped=%s pending_silver=%s failed=%s",
+                len(loaded), len(loaded_incremental), len(skipped), len(skipped_pending),
+                len(failed))
 
     if failed:
         raise RuntimeError(f"Ingestion finished with failed letters: {failed}")

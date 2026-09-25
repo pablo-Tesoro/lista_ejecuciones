@@ -66,6 +66,7 @@ def main() -> None:
 
     # ── Final summary ───────────────────────────────────────────
     logger.info("Loaded letters: %s", summary["loaded"] or "none")
+    logger.info("  of which incremental: %s", summary["loaded_incremental"] or "none")
     logger.info("Skipped letters: %s", summary["skipped"] or "none")
     logger.info("=" * 60)
     logger.info("END - Executions List Ingestion")
