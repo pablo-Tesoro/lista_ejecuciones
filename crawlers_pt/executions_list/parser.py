@@ -35,7 +35,7 @@ def extract_all_updatepanels(text: str) -> str:
 
 
 def build_soup(html: str) -> BeautifulSoup:
-    return BeautifulSoup(html, "lxml")
+    return BeautifulSoup(html, "html.parser")
 
 
 # ==========================================================
