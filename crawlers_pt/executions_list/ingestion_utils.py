@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from pyspark.sql import functions as F
 
-from .constants import BRONZE_SCHEMA, BRONZE_TABLE, LETTER_CONTROL_TABLE, SILVER_TABLE
+from .constants import BRONZE_SCHEMA, BRONZE_TABLE, LETTER_CONTROL_TABLE, LETTERS, SILVER_TABLE
 from .crawler import CitiusCrawler
 from .process_control import watermark_literal
 from .settings import CrawlerSettings
@@ -258,19 +258,19 @@ def crawl_letter_incremental(
 # ==========================================================
 def select_letters(param: str | None, config_letters: list[str]) -> list[str]:
     """
-    Letras que procesa esta tarea: las del parámetro ("A,M,Z") o, si viene
-    vacío o "ALL", todas las de la configuración. Varias tareas en paralelo
-    deben repartirse las letras sin repetir ninguna.
+    Letras que procesa esta tarea: las del parámetro ("A,M,Z"), aunque no estén
+    en la configuración, o, si viene vacío o "ALL", las de la configuración.
+    Varias tareas en paralelo deben repartirse las letras sin repetir ninguna.
     """
-    allowed = [x.upper() for x in config_letters]
     raw = (param or "").strip().upper()
     if raw in ("", "ALL", "*"):
-        return allowed
+        return [x.upper() for x in config_letters]
 
     letters = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
-    unknown = [x for x in letters if x not in allowed]
-    if unknown or not letters:
-        raise ValueError(f"Invalid letters parameter {param!r}: unknown letters {unknown}")
+    invalid = [x for x in letters if x not in LETTERS]
+    if invalid or not letters:
+        raise ValueError(f"Invalid letters parameter {param!r}: expected letters A-Z "
+                         f"separated by commas, invalid: {invalid}")
     return letters
 
 
