@@ -10,6 +10,10 @@ SILVER_TABLE = f"{SILVER_SCHEMA}.execution_list"
 LETTER_CONTROL_TABLE = f"{SILVER_SCHEMA}.letter_control"
 PROCESS_CONTROL_TABLE = f"{SILVER_SCHEMA}.process_control"
 
+# Clave del watermark en process_control: la escribe la transformación y la lee
+# la ingesta. Si no coinciden, la ingesta no ve el watermark y borra Bronze.
+PROCESS_ID = "Executions"
+
 LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 # Campos del formulario ASP.NET

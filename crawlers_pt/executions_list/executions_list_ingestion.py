@@ -6,12 +6,12 @@ import src.dataplatform_tenders.crawlers_pt.executions_list.ingestion_utils as i
 from src.dataplatform_tenders.crawlers_pt.executions_list.constants import (
     BRONZE_TABLE,
     PROCESS_CONTROL_TABLE,
+    PROCESS_ID,
 )
 from src.dataplatform_tenders.crawlers_pt.executions_list.settings import CrawlerSettings
 import logging
 
 logger = logging.getLogger("dataplatform_tenders.crawlers_pt.executions_list_ingestion")
-process_id = "Executions"
 
 
 def main() -> None:
@@ -45,7 +45,7 @@ def main() -> None:
     # ── Process ─────────────────────────────────────────────────
     logger.info("Consulting last time processed...")
     last_time_processed = utils_general.get_last_timestamp_processed(
-        process_id=process_id, catalog=catalog, table_name=PROCESS_CONTROL_TABLE
+        process_id=PROCESS_ID, catalog=catalog, table_name=PROCESS_CONTROL_TABLE
     )
     logger.info("Last time processed: %s", last_time_processed)
 
