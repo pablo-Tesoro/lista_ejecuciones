@@ -18,6 +18,7 @@ from pyspark.sql import functions as F
 
 from .constants import BRONZE_SCHEMA, BRONZE_TABLE, LETTER_CONTROL_TABLE, SILVER_TABLE
 from .crawler import CitiusCrawler
+from .process_control import watermark_literal
 from .settings import CrawlerSettings
 
 logger = logging.getLogger("dataplatform_tenders.crawlers_pt.executions_list_ingestion")
@@ -253,8 +254,48 @@ def crawl_letter_incremental(
 
 
 # ==========================================================
+# LETRAS DE LA TAREA
+# ==========================================================
+def select_letters(param: str | None, config_letters: list[str]) -> list[str]:
+    """
+    Letras que procesa esta tarea: las del parámetro ("A,M,Z") o, si viene
+    vacío o "ALL", todas las de la configuración. Varias tareas en paralelo
+    deben repartirse las letras sin repetir ninguna.
+    """
+    allowed = [x.upper() for x in config_letters]
+    raw = (param or "").strip().upper()
+    if raw in ("", "ALL", "*"):
+        return allowed
+
+    letters = list(dict.fromkeys(x.strip() for x in raw.split(",") if x.strip()))
+    unknown = [x for x in letters if x not in allowed]
+    if unknown or not letters:
+        raise ValueError(f"Invalid letters parameter {param!r}: unknown letters {unknown}")
+    return letters
+
+
+def _in_list(letters: list[str]) -> str:
+    return ", ".join(f"'{x}'" for x in letters)
+
+
+# ==========================================================
 # LECTURAS Y ESCRITURA
 # ==========================================================
+def delete_unconsolidated_snapshots(spark, catalog: str, *, letters: list[str],
+                                    watermark) -> None:
+    """
+    Borra de Bronze las fotos de estas letras posteriores al watermark: las dejó
+    una ingesta que ninguna transformación llegó a consolidar. Sólo toca las
+    letras de la tarea, para no borrar lo que otra tarea en paralelo acaba de
+    escribir, y así cada tarea se puede relanzar sola.
+    """
+    spark.sql(f"""
+        DELETE FROM {catalog}.{BRONZE_TABLE}
+         WHERE letter IN ({_in_list(letters)})
+           AND dp_update_ts > {watermark_literal(watermark)}
+    """)
+
+
 def ensure_tables(spark, catalog: str) -> None:
     """Sólo la tabla de Bronze: la ingesta no crea nada de Silver."""
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS {catalog}.{BRONZE_SCHEMA}")
@@ -269,13 +310,13 @@ def ensure_tables(spark, catalog: str) -> None:
     """)
 
 
-def read_control_totals(spark, catalog: str) -> dict[str, int]:
+def read_control_totals(spark, catalog: str, letters: list[str]) -> dict[str, int]:
     """letter -> total_records de la versión vigente (comprobación 1)."""
     try:
         rows = spark.sql(f"""
             SELECT letter, total_records
               FROM {catalog}.{LETTER_CONTROL_TABLE}
-             WHERE is_current
+             WHERE is_current AND letter IN ({_in_list(letters)})
         """).collect()
     except Exception:
         return {}
@@ -288,9 +329,11 @@ class BronzeSnapshotInfo:
     total_rows: int
 
 
-def read_bronze_last_snapshots(spark, catalog: str) -> dict[str, BronzeSnapshotInfo]:
+def read_bronze_last_snapshots(spark, catalog: str,
+                               letters: list[str]) -> dict[str, BronzeSnapshotInfo]:
     """letter -> primer registro (9 campos crudos) y nº de filas del último snapshot."""
     cols = ", ".join(f"b.{c}" for c in SITE_FIELDS)
+    in_list = _in_list(letters)
     try:
         rows = spark.sql(f"""
             SELECT letter, total_rows, {", ".join(SITE_FIELDS)}
@@ -298,8 +341,11 @@ def read_bronze_last_snapshots(spark, catalog: str) -> dict[str, BronzeSnapshotI
                            COUNT(*) OVER (PARTITION BY b.letter) AS total_rows
                       FROM {catalog}.{BRONZE_TABLE} b
                       JOIN (SELECT letter, MAX(dp_update_ts) AS ts
-                              FROM {catalog}.{BRONZE_TABLE} GROUP BY letter) m
-                        ON b.letter = m.letter AND b.dp_update_ts = m.ts)
+                              FROM {catalog}.{BRONZE_TABLE}
+                             WHERE letter IN ({in_list})
+                             GROUP BY letter) m
+                        ON b.letter = m.letter AND b.dp_update_ts = m.ts
+                     WHERE b.letter IN ({in_list}))
              WHERE page_number = 1 AND position_in_page = 1
         """).collect()
     except Exception:
@@ -351,11 +397,10 @@ def write_letter_snapshot(spark, catalog: str, snapshot: LetterSnapshot) -> None
         logger.info("Letter %s loaded | 0 rows: nothing to write in Bronze", letter)
         return
 
-    df = spark.createDataFrame(
-        [tuple(r[c] for c in BRONZE_DATA_COLUMNS) for r in snapshot.rows],
-        schema=BRONZE_DATA_DDL,
-    )
+    rows = [tuple(r[c] for c in BRONZE_DATA_COLUMNS) for r in snapshot.rows]
     if snapshot.carried_rows:
+        # Se leen antes de escribir para que la escritura sea un append ciego: Delta
+        # no la hace chocar con lo que escriben a la vez las tareas de otras letras.
         table = f"{catalog}.{BRONZE_TABLE}"
         shift = len(snapshot.rows)
         carried = spark.sql(f"""
@@ -369,8 +414,14 @@ def write_letter_snapshot(spark, catalog: str, snapshot: LetterSnapshot) -> None
                      WHERE letter = '{letter}'
                        AND dp_update_ts = (SELECT MAX(dp_update_ts) FROM {table}
                                             WHERE letter = '{letter}'))
-        """)
-        df = df.unionByName(carried)
+        """).collect()
+        if len(carried) != snapshot.carried_rows:
+            raise RuntimeError(
+                f"Letter {letter}: expected to carry {snapshot.carried_rows} rows from the "
+                f"last Bronze snapshot but found {len(carried)}.")
+        rows += [tuple(r) for r in carried]
+
+    df = spark.createDataFrame(rows, schema=BRONZE_DATA_DDL)
     df = (
         df.withColumn("ingestion_date", F.current_date())
         .withColumn("dp_update_ts", F.current_timestamp())
@@ -401,14 +452,13 @@ def run_ingestion(
     Recorre las letras, decide cuáles hay que descargar y escribe Bronze.
 
     El borrado de lo no consolidado NO se hace aquí: lo hace el punto de
-    entrada con utils_general.delete_records_after_ingestion_timestamp,
-    antes de llamar a esta función.
+    entrada con delete_unconsolidated_snapshots, antes de llamar a esta función.
     """
     letters = [x.upper() for x in letters]
     force = {x.upper() for x in (forced_letters or [])}
 
-    control = control_loader(spark, catalog)
-    bronze_last = bronze_loader(spark, catalog)
+    control = control_loader(spark, catalog, letters)
+    bronze_last = bronze_loader(spark, catalog, letters)
     logger.info("Current state -> letters in control: %s, snapshots in Bronze: %s",
                 len(control), len(bronze_last))
 

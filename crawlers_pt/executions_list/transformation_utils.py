@@ -56,6 +56,7 @@ from .constants import (
     PROCESS_ID,
     SILVER_TABLE,
 )
+from .process_control import read_watermark, ts_literal, watermark_literal
 
 logger = logging.getLogger("dataplatform_tenders.crawlers_pt.executions_list_transformation")
 
@@ -87,7 +88,6 @@ CONTROL_COLUMNS = (
 )
 
 OPEN = "CAST(NULL AS TIMESTAMP)"   # valid_to_date de una versión vigente
-NO_WATERMARK = "TIMESTAMP'1900-01-01 00:00:00'"
 
 V_PROCESSED = "_executions_processed"
 V_DELTA = "_executions_delta"
@@ -347,20 +347,6 @@ def sql_advance_watermark(process_table: str, process_id: str, watermark: str) -
 # ==========================================================
 # TRANSFORMACIÓN
 # ==========================================================
-def ts_literal(value) -> str:
-    return f"TIMESTAMP'{value.strftime('%Y-%m-%d %H:%M:%S.%f')}'"
-
-
-def read_watermark(spark, process_table: str):
-    """last_processed_ts del proceso, o None si nunca se ha consolidado nada."""
-    row = spark.sql(f"""
-        SELECT MAX(last_processed_ts) AS wm
-          FROM {process_table}
-         WHERE process_id = '{PROCESS_ID}'
-    """).first()
-    return row["wm"] if row else None
-
-
 def _count(spark, sql: str) -> int:
     return int(spark.sql(sql).first()["n"])
 
@@ -372,8 +358,8 @@ def run_transformation(spark, *, catalog: str) -> dict:
     process = f"{catalog}.{PROCESS_CONTROL_TABLE}"
 
     # 1. Watermark
-    wm_value = read_watermark(spark, process)
-    watermark = ts_literal(wm_value) if wm_value else NO_WATERMARK
+    wm_value = read_watermark(spark, catalog)
+    watermark = watermark_literal(wm_value)
     logger.info("Watermark (process_id=%s): %s", PROCESS_ID, watermark)
 
     # 2. Ventana

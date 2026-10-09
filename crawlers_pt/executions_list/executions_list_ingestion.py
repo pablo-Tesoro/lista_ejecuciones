@@ -3,11 +3,7 @@ from src.dataplatform_tenders.crawlers_pt.common.logging_config import setup_log
 
 import src.dataplatform_tenders.crawlers_pt.common.utils_general as utils_general
 import src.dataplatform_tenders.crawlers_pt.executions_list.ingestion_utils as ingestion_utils
-from src.dataplatform_tenders.crawlers_pt.executions_list.constants import (
-    BRONZE_TABLE,
-    PROCESS_CONTROL_TABLE,
-    PROCESS_ID,
-)
+import src.dataplatform_tenders.crawlers_pt.executions_list.process_control as process_control
 from src.dataplatform_tenders.crawlers_pt.executions_list.settings import CrawlerSettings
 import logging
 
@@ -24,11 +20,13 @@ def main() -> None:
     logger.info("=" * 60)
 
     # ── Parameters ──────────────────────────────────────────────
-    kwargs = ["catalog", "env"]
+    # letters: las letras de esta tarea ("A,M,Z"), o "ALL" para todas.
+    kwargs = ["catalog", "env", "letters"]
     args = utils_general.get_args(kwargs)
     catalog = args.catalog
     env = args.env
-    logger.info("Parameters received -> catalog: %s, env: %s", catalog, env)
+    logger.info("Parameters received -> catalog: %s, env: %s, letters: %s",
+                catalog, env, args.letters)
 
     # ── Configuration ───────────────────────────────────────────
     logger.info("Reading configuration files...")
@@ -37,21 +35,19 @@ def main() -> None:
     )
     config_env = config_general_executions_list[env]
     settings = CrawlerSettings.from_config(config_env)
-    letters = config_env["letters"]
+    letters = ingestion_utils.select_letters(args.letters, config_env["letters"])
     forced_letters = config_env.get("forced_letters", [])
     logger.info("Configuration loaded successfully -> url: %s, period: %s, letters: %s",
-                settings.url, settings.period, len(letters))
+                settings.url, settings.period, ",".join(letters))
 
     # ── Process ─────────────────────────────────────────────────
     logger.info("Consulting last time processed...")
-    last_time_processed = utils_general.get_last_timestamp_processed(
-        process_id=PROCESS_ID, catalog=catalog, table_name=PROCESS_CONTROL_TABLE
-    )
-    logger.info("Last time processed: %s", last_time_processed)
+    last_time_processed = process_control.read_watermark(spark, catalog)
+    logger.info("Last time processed: %s", process_control.watermark_literal(last_time_processed))
 
-    logger.info("Deleting unprocessed records...")
-    utils_general.delete_records_after_ingestion_timestamp(
-        catalog=catalog, table_name=BRONZE_TABLE, ingestion_timestamp=last_time_processed
+    logger.info("Deleting unprocessed records of letters %s...", ",".join(letters))
+    ingestion_utils.delete_unconsolidated_snapshots(
+        spark, catalog, letters=letters, watermark=last_time_processed
     )
     logger.info("deleted unprocessed records")
 
