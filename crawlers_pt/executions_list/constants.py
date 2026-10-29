@@ -4,7 +4,8 @@
 # resto de procesos de crawlers_pt.
 BRONZE_SCHEMA = "bronze_raw_executions_list"
 SILVER_SCHEMA = "silver_master_executions_list"
-GOLD_SCHEMA = "gold_executions_list"
+# Lleva mayúsculas: va entre acentos graves, como en sql/gold.sql.
+GOLD_SCHEMA = "`gold_iberinformacional_crawlersPt_executionsList_001`"
 
 BRONZE_TABLE = f"{BRONZE_SCHEMA}.execution_list"
 SILVER_TABLE = f"{SILVER_SCHEMA}.execution_list"
@@ -12,7 +13,6 @@ LETTER_CONTROL_TABLE = f"{SILVER_SCHEMA}.letter_control"
 PROCESS_CONTROL_TABLE = f"{SILVER_SCHEMA}.process_control"
 GOLD_TABLE = f"{GOLD_SCHEMA}.execution_list"
 GOLD_LETTER_CONTROL_TABLE = f"{GOLD_SCHEMA}.letter_control"
-DQ_RESULTS_TABLE = f"{GOLD_SCHEMA}.dq_results"
 
 # Clave del watermark en process_control: la escribe la transformación y la lee
 # la ingesta. Si no coinciden, la ingesta no ve el watermark y borra Bronze.
