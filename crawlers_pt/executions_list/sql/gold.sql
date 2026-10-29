@@ -58,7 +58,18 @@ COMMENT 'Cobertura por letra: cuantos registros tiene y cuando se verifico';
 
 -- ==========================================================
 -- RESTRICCIONES
+-- ADD CONSTRAINT falla si ya existe, así que se borran antes para que el
+-- script se pueda relanzar. La FK primero: depende de la PK de letter_control.
 -- ==========================================================
+ALTER TABLE ${catalog}.`gold_iberinformacional_crawlersPt_executionsList_001`.execution_list
+  DROP CONSTRAINT IF EXISTS fk_gold_execution_list_letter;
+
+ALTER TABLE ${catalog}.`gold_iberinformacional_crawlersPt_executionsList_001`.execution_list
+  DROP CONSTRAINT IF EXISTS pk_gold_execution_list;
+
+ALTER TABLE ${catalog}.`gold_iberinformacional_crawlersPt_executionsList_001`.letter_control
+  DROP CONSTRAINT IF EXISTS pk_gold_letter_control;
+
 ALTER TABLE ${catalog}.`gold_iberinformacional_crawlersPt_executionsList_001`.letter_control
   ADD CONSTRAINT pk_gold_letter_control PRIMARY KEY (letter);
 
