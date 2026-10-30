@@ -5,8 +5,6 @@ import src.dataplatform_tenders.crawlers_pt.common.utils_general as utils_genera
 import src.dataplatform_tenders.crawlers_pt.executions_list.transformation_utils as transformation_utils
 import logging
 
-from pyspark.sql import SparkSession
-
 logger = logging.getLogger("dataplatform_tenders.crawlers_pt.executions_list_transformation")
 
 
@@ -25,7 +23,6 @@ def main() -> None:
     logger.info("Parameters received -> catalog: %s", catalog)
 
     # ── Process ─────────────────────────────────────────────────
-    spark = SparkSession.builder.getOrCreate()
     transformation_utils.run_transformation(spark, catalog=catalog)
 
     logger.info("=" * 60)
