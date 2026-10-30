@@ -69,6 +69,8 @@ HASH_FIELDS = [
 # Clave de negocio: las cuatro columnas son NOT NULL en Silver.
 KEY_COLS = ["case_number", "name", "debt_amount", "reason"]
 
+AND = " AND "
+
 DELTA_COLUMNS = (
     "case_number, name, debt_amount, reason, letter, court, org_unit, "
     "enforcement_agent, termination_date, inclusion_date, "
@@ -99,7 +101,7 @@ V_CLOSES = "_executions_closes"
 
 def key_join(a: str, b: str) -> str:
     """Igualdad simple por clave: sql_delta_dedup garantiza que no hay NULL."""
-    return " AND ".join(f"{a}.{c} = {b}.{c}" for c in KEY_COLS)
+    return AND.join(f"{a}.{c} = {b}.{c}" for c in KEY_COLS)
 
 
 # ==========================================================
@@ -178,7 +180,7 @@ def sql_delta_dedup(delta_view: str) -> str:
     incompletas y, entre repetidas, conserva la primera aparición en el listado.
     """
     order = ", ".join(KEY_COLS)
-    not_null = " AND ".join(f"d.{c} IS NOT NULL" for c in KEY_COLS)
+    not_null = AND.join(f"d.{c} IS NOT NULL" for c in KEY_COLS)
     return f"""
         SELECT {DELTA_COLUMNS} FROM (
             SELECT d.*,
@@ -248,7 +250,7 @@ def sql_close_candidates(silver_table: str, processed_view: str,
     se pudo construir.
     """
     cols = ", ".join(f"t.{c}" for c in KEY_COLS)
-    protect = " AND ".join(f"i.{c} = t.{c}" for c in KEY_COLS if c != "debt_amount")
+    protect = AND.join(f"i.{c} = t.{c}" for c in KEY_COLS if c != "debt_amount")
     return f"""
         SELECT {cols}, p.snapshot_ts
           FROM {silver_table} t

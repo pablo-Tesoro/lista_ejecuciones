@@ -77,31 +77,25 @@ def find_results_table(soup: BeautifulSoup) -> Optional[Tag]:
     return table if isinstance(table, Tag) else None
 
 
+def _value_after(node: Tag) -> str:
+    """Texto del primer <span> o texto no vacío que sigue a node (máx. 30 hermanos)."""
+    nxt = node.next_sibling
+    for _ in range(30):
+        if nxt is None:
+            return ""
+        if getattr(nxt, "name", None) == "span":
+            return nxt.get_text(" ", strip=True)
+        if isinstance(nxt, str) and nxt.strip():
+            return nxt.strip()
+        nxt = getattr(nxt, "next_sibling", None)
+    return ""
+
+
 def _extract_labeled_value(td: Tag, label: str) -> str:
     target = label.strip().lower()
-
     for strong in td.find_all("strong"):
-        strong_txt = strong.get_text(" ", strip=True).strip().lower()
-
-        if strong_txt == target:
-            nxt = strong.next_sibling
-
-            for _ in range(30):
-                if nxt is None:
-                    break
-
-                if getattr(nxt, "name", None) == "span":
-                    return nxt.get_text(" ", strip=True)
-
-                if isinstance(nxt, str):
-                    txt = nxt.strip()
-                    if txt:
-                        return txt
-
-                nxt = getattr(nxt, "next_sibling", None)
-
-            break
-
+        if strong.get_text(" ", strip=True).strip().lower() == target:
+            return _value_after(strong)
     return ""
 
 

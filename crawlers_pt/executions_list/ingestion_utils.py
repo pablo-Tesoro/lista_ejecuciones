@@ -436,6 +436,89 @@ def write_letter_snapshot(spark, catalog: str, snapshot: LetterSnapshot) -> None
 # ==========================================================
 # BUCLE DE INGESTA
 # ==========================================================
+DOWNLOAD, SKIP, SKIP_PENDING = "download", "skip", "skip_pending"
+LOADED, LOADED_INCREMENTAL, SKIPPED, SKIPPED_PENDING = (
+    "loaded", "loaded_incremental", "skipped", "skipped_pending_silver")
+
+
+def decide_letter(*, forced: bool, stored_total: int | None, page1,
+                  bronze_snapshot: BronzeSnapshotInfo | None,
+                  is_current_in_silver) -> tuple[str, str]:
+    """
+    Qué hacer con una letra tras leer su página 1: (DOWNLOAD | SKIP | SKIP_PENDING,
+    motivo). Gana la primera condición que se cumple; Silver sólo se consulta al final.
+    """
+    site_total = int(page1.record_count or 0)
+    fresh_hash = first_record_hash(page1.parsed_rows, site_total)
+    bronze_values = bronze_snapshot.first_values if bronze_snapshot else None
+
+    if forced:
+        return DOWNLOAD, "forced"
+    if stored_total is None:
+        return DOWNLOAD, "first load"
+    if stored_total != site_total:
+        return DOWNLOAD, "total differs"
+    if first_record_values(page1.parsed_rows, site_total) != bronze_values:
+        return DOWNLOAD, "first record differs from Bronze"
+    if fresh_hash is None:
+        return SKIP, "unchanged (empty)"
+    if is_current_in_silver(fresh_hash):
+        return SKIP, f"unchanged (total={site_total})"
+    # Tras el borrado previo, Bronze sólo contiene snapshots ya consolidados: si
+    # Silver no tiene ese primer registro es porque no puede representarlo.
+    return SKIP_PENDING, ("first record matches Bronze but is not current in Silver "
+                          "(likely an incomplete key)")
+
+
+def download_letter(crawler: CitiusCrawler, letter: str, page1, *, reason: str, forced: bool,
+                    stored_total: int | None,
+                    bronze_snapshot: BronzeSnapshotInfo | None) -> LetterSnapshot:
+    """
+    Incremental sólo si la última foto de Bronze es la que refleja letter_control
+    (mismo nº de filas) y el contador ha crecido; si no, descarga completa.
+    """
+    site_total = int(page1.record_count or 0)
+    can_be_incremental = (
+        not forced
+        and stored_total is not None
+        and bronze_snapshot is not None
+        and bronze_snapshot.total_rows == stored_total
+        and site_total > stored_total
+    )
+    if can_be_incremental:
+        logger.info("Letter %s -> trying incremental load (%s: %s -> %s)",
+                    letter, reason, stored_total, site_total)
+        return crawl_letter_incremental(
+            crawler, letter=letter, page1=page1, previous_total=stored_total,
+            previous_first_values=bronze_snapshot.first_values)
+
+    logger.info("Letter %s -> full download (%s)", letter, reason)
+    return crawl_letter(crawler, letter=letter, page1=page1)
+
+
+def process_letter(spark, catalog: str, crawler: CitiusCrawler, letter: str, *, forced: bool,
+                   stored_total: int | None, bronze_snapshot: BronzeSnapshotInfo | None,
+                   silver_checker, snapshot_writer) -> str:
+    """Una letra completa: página 1, decisión, descarga y escritura. Devuelve su resultado."""
+    page1 = crawler.fetch_first_page(letter=letter, period=crawler.settings.period)
+    action, reason = decide_letter(
+        forced=forced, stored_total=stored_total, page1=page1,
+        bronze_snapshot=bronze_snapshot,
+        is_current_in_silver=lambda row_hash: silver_checker(spark, catalog, letter, row_hash),
+    )
+    if action == SKIP:
+        logger.info("Letter %s %s -> skipped", letter, reason)
+        return SKIPPED
+    if action == SKIP_PENDING:
+        logger.warning("Letter %s: %s -> skipped", letter, reason)
+        return SKIPPED_PENDING
+
+    snapshot = download_letter(crawler, letter, page1, reason=reason, forced=forced,
+                               stored_total=stored_total, bronze_snapshot=bronze_snapshot)
+    snapshot_writer(spark, catalog, snapshot)
+    return LOADED_INCREMENTAL if snapshot.carried_rows else LOADED
+
+
 def run_ingestion(
     spark,
     *,
@@ -463,77 +546,22 @@ def run_ingestion(
                 len(control), len(bronze_last))
 
     crawler = CitiusCrawler(logger=logger, settings=settings)
-
-    loaded: list[str] = []
-    loaded_incremental: list[str] = []
-    skipped: list[str] = []
-    skipped_pending: list[str] = []
+    outcomes: dict[str, list[str]] = {
+        LOADED: [], LOADED_INCREMENTAL: [], SKIPPED: [], SKIPPED_PENDING: []}
     failed: dict[str, str] = {}
 
     try:
         for letter in letters:
             try:
-                page1 = crawler.fetch_first_page(letter=letter, period=settings.period)
-                site_total = int(page1.record_count or 0)
-                fresh_values = first_record_values(page1.parsed_rows, site_total)
-                fresh_hash = first_record_hash(page1.parsed_rows, site_total)
-
-                stored_total = control.get(letter)
-                bronze_snapshot = bronze_last.get(letter)
-                bronze_values = bronze_snapshot.first_values if bronze_snapshot else None
-
-                if letter in force:
-                    reason = "forced"
-                elif stored_total is None:
-                    reason = "first load"
-                elif stored_total != site_total:
-                    reason = "total differs"
-                elif fresh_values != bronze_values:
-                    reason = "first record differs from Bronze"
-                elif fresh_hash is None:
-                    logger.info("Letter %s unchanged (empty) -> skipped", letter)
-                    skipped.append(letter)
-                    continue
-                elif silver_checker(spark, catalog, letter, fresh_hash):
-                    logger.info("Letter %s unchanged (total=%s) -> skipped", letter, site_total)
-                    skipped.append(letter)
-                    continue
-                else:
-                    # Tras el borrado previo, Bronze sólo contiene snapshots ya
-                    # consolidados: si Silver no tiene ese primer registro es
-                    # porque no puede representarlo (clave incompleta).
-                    logger.warning(
-                        "Letter %s: first record matches Bronze but is not current in "
-                        "Silver (likely an incomplete key) -> skipped", letter)
-                    skipped_pending.append(letter)
-                    continue
-
-                # Incremental sólo si la última foto de Bronze es la que refleja
-                # letter_control (mismo nº de filas) y el contador ha crecido.
-                can_be_incremental = (
-                    letter not in force
-                    and stored_total is not None
-                    and bronze_snapshot is not None
-                    and bronze_snapshot.total_rows == stored_total
-                    and site_total > stored_total
+                outcome = process_letter(
+                    spark, catalog, crawler, letter,
+                    forced=letter in force,
+                    stored_total=control.get(letter),
+                    bronze_snapshot=bronze_last.get(letter),
+                    silver_checker=silver_checker,
+                    snapshot_writer=snapshot_writer,
                 )
-                if can_be_incremental:
-                    logger.info("Letter %s -> trying incremental load (%s: %s -> %s)",
-                                letter, reason, stored_total, site_total)
-                    snapshot = crawl_letter_incremental(
-                        crawler, letter=letter, page1=page1,
-                        previous_total=stored_total,
-                        previous_first_values=bronze_snapshot.first_values,
-                    )
-                else:
-                    logger.info("Letter %s -> full download (%s)", letter, reason)
-                    snapshot = crawl_letter(crawler, letter=letter, page1=page1)
-
-                snapshot_writer(spark, catalog, snapshot)
-                loaded.append(letter)
-                if snapshot.carried_rows:
-                    loaded_incremental.append(letter)
-
+                outcomes[outcome].append(letter)
             except Exception as exc:
                 logger.exception("Letter %s failed; nothing written for it.", letter)
                 failed[letter] = str(exc)
@@ -543,15 +571,15 @@ def run_ingestion(
         crawler.close()
 
     summary = {
-        "loaded": loaded,
-        "loaded_incremental": loaded_incremental,
-        "skipped": skipped,
-        "skipped_pending_silver": skipped_pending,
+        "loaded": outcomes[LOADED] + outcomes[LOADED_INCREMENTAL],
+        "loaded_incremental": outcomes[LOADED_INCREMENTAL],
+        "skipped": outcomes[SKIPPED],
+        "skipped_pending_silver": outcomes[SKIPPED_PENDING],
         "failed": failed,
     }
     logger.info("Letters -> loaded=%s (incremental=%s) skipped=%s pending_silver=%s failed=%s",
-                len(loaded), len(loaded_incremental), len(skipped), len(skipped_pending),
-                len(failed))
+                len(summary["loaded"]), len(summary["loaded_incremental"]),
+                len(summary["skipped"]), len(summary["skipped_pending_silver"]), len(failed))
 
     if failed:
         raise RuntimeError(f"Ingestion finished with failed letters: {failed}")
